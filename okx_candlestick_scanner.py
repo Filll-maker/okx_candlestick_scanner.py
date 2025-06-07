@@ -1,102 +1,91 @@
+
 import streamlit as st
-import pandas as pd
 import requests
-from candlestick import candlestick
+import pandas as pd
+import talib
+from datetime import datetime, timedelta
 import time
-from datetime import datetime
 
-# --- Настройки ---
-TIMEFRAMES = ['1m', '5m', '15m', '1H', '4H', '1D']
-PATTERN_FUNCTIONS = {
-    'hammer': candlestick.hammer,
-    'engulfing': candlestick.engulfing,
-    'doji': candlestick.doji,
-    'shooting_star': candlestick.shooting_star,
-    'hanging_man': candlestick.hanging_man,
-    'inverted_hammer': candlestick.inverted_hammer,
-    'morning_star': candlestick.morning_star,
-    'evening_star': candlestick.evening_star
-}
+OKX_BASE_URL = "https://www.okx.com"
 
-# --- Получение данных с OKX ---
-@st.cache_data(ttl=3600)
-def get_okx_symbols():
-    url = "https://www.okx.com/api/v5/public/instruments?instType=SPOT"
-    res = requests.get(url)
-    data = res.json()['data']
-    return [d['instId'] for d in data if d['instId'].endswith('USDT')]
+@st.cache_data
+def get_all_symbols():
+    response = requests.get(f"{OKX_BASE_URL}/api/v5/public/instruments?instType=SPOT")
+    if response.status_code == 200:
+        data = response.json()
+        return [item['instId'] for item in data['data']]
+    return []
 
+@st.cache_data
 def get_ohlcv(symbol, timeframe, limit=100):
-    url = "https://www.okx.com/api/v5/market/candles"
-    params = {'instId': symbol, 'bar': timeframe, 'limit': limit}
-    res = requests.get(url, params=params)
-    if res.status_code != 200 or 'data' not in res.json():
+    response = requests.get(
+        f"{OKX_BASE_URL}/api/v5/market/candles?instId={symbol}&bar={timeframe}&limit={limit}"
+    )
+    if response.status_code == 200:
+        raw_data = response.json()['data']
+        df = pd.DataFrame(raw_data, columns=[
+            'ts', 'open', 'high', 'low', 'close', 'volume'
+        ])
+        df = df.astype({
+            'open': 'float', 'high': 'float', 'low': 'float', 'close': 'float'
+        })
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+        df = df.sort_values('ts').reset_index(drop=True)
+        return df
+    return pd.DataFrame()
+
+def detect_patterns(df, pattern_func):
+    try:
+        result = pattern_func(
+            df['open'], df['high'], df['low'], df['close']
+        )
+        last_index = result[result != 0].index
+        if not last_index.empty:
+            last_signal_index = last_index[-1]
+            candles_ago = len(df) - 1 - last_signal_index
+            if candles_ago <= max_signal_age:
+                return candles_ago
+        return None
+    except Exception:
         return None
 
-    raw = res.json()['data']
-    df = pd.DataFrame(raw, columns=[
-        'ts', 'open', 'high', 'low', 'close', 'volume', 'volCcy', 'volCcyQuote', 'confirm'
-    ])
-    df = df.iloc[::-1]
-    df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
-    df['timestamp'] = pd.to_datetime(df['ts'], unit='ms')
-    return df
+st.title("📈 OKX Candlestick Pattern Scanner")
 
-def process_symbol(symbol, timeframe, pattern_list):
+with st.sidebar:
+    selected_patterns = st.multiselect(
+        "Выбери свечные паттерны:",
+        options=[p for p in dir(talib) if p.startswith("CDL")],
+        default=["CDLENGULFING", "CDLHAMMER", "CDLSHOOTINGSTAR"]
+    )
+    timeframe = st.selectbox(
+        "Таймфрейм:",
+        options=["1m", "5m", "15m", "1h", "4h", "1d"],
+        index=3
+    )
+    max_signal_age = st.slider("Макс. возраст сигнала (в свечах):", 0, 10, 2)
+
+st.write(f"🔍 Поиск сигналов на всех монетах OKX за таймфрейм `{timeframe}`...")
+
+symbols = get_all_symbols()
+results = []
+
+for symbol in symbols:
     df = get_ohlcv(symbol, timeframe)
-    if df is None or df.empty:
-        return []
+    if df.empty or len(df) < 10:
+        continue
 
-    results = []
-    for pattern_name in pattern_list:
-        try:
-            func = PATTERN_FUNCTIONS[pattern_name]
-            df_copy = df.copy()
-            func(df_copy)
-            col = f'{pattern_name}_bar_num'
-            if col in df_copy.columns and not df_copy[col].isna().all():
-                if df_copy[col].iloc[-1] == 0:
-                    ts = df_copy['timestamp'].iloc[-1]
-                    age_min = round((datetime.utcnow() - ts.to_pydatetime()).total_seconds() / 60)
-                    results.append({
-                        'symbol': symbol,
-                        'pattern': pattern_name,
-                        'timeframe': timeframe,
-                        'timestamp': ts,
-                        'age_min': age_min
-                    })
-        except:
-            continue
-    return results
+    for pattern in selected_patterns:
+        func = getattr(talib, pattern)
+        signal_age = detect_patterns(df, func)
+        if signal_age is not None:
+            results.append({
+                "Symbol": symbol,
+                "Pattern": pattern,
+                "Candles ago": signal_age
+            })
 
-# --- Интерфейс Streamlit ---
-st.title("📊 OKX Candlestick Scanner")
-
-selected_tf = st.selectbox("Выберите таймфрейм:", TIMEFRAMES)
-selected_patterns = st.multiselect(
-    "Выберите паттерны:", list(PATTERN_FUNCTIONS.keys()),
-    default=["hammer", "engulfing", "doji"]
-)
-
-max_age = st.slider("Максимальный возраст сигнала (в минутах):", 0, 240, 30, step=5)
-
-if st.button("🔍 Начать сканирование"):
-    with st.spinner("Загружаем данные и ищем сигналы..."):
-        symbols = get_okx_symbols()
-        results = []
-        for i, symbol in enumerate(symbols):
-            st.text(f"[{i+1}/{len(symbols)}] {symbol}")
-            signals = process_symbol(symbol, selected_tf, selected_patterns)
-            results.extend(signals)
-            time.sleep(0.15)
-
-    if results:
-        df_results = pd.DataFrame(results)
-        df_filtered = df_results[df_results["age_min"] <= max_age]
-        if df_filtered.empty:
-            st.warning(f"❌ Нет сигналов моложе {max_age} мин.")
-        else:
-            st.success(f"✅ Найдено {len(df_filtered)} сигналов младше {max_age} мин.")
-            st.dataframe(df_filtered)
-    else:
-        st.warning("❌ Паттерны не найдены.")
+if results:
+    st.success(f"✅ Найдено {len(results)} сигналов:")
+    st.dataframe(pd.DataFrame(results))
+else:
+    st.warning("❌ Сигналы не найдены.")
